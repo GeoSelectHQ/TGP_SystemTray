@@ -7,6 +7,7 @@ using System.Linq;
 using System.Management;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Net.NetworkInformation;
 using System.Security.Principal;
 using System.Text;
@@ -25,10 +26,25 @@ namespace TelemetryAgent
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             
-            TelemetryAgent agent = new TelemetryAgent("https://your-server-url.com/api/telemetry", 300);
+            // Configure your Supabase project details here
+            SupabaseConfig config = new SupabaseConfig
+            {
+                ProjectUrl = "https://qkvnvglkfixivqmzhhgc.supabase.co",
+                ApiKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFrdm52Z2xrZml4aXZxbXpoaGdjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDEwOTkxMjAsImV4cCI6MjA1NjY3NTEyMH0.UTWoOTwEVM9Y7beGiYlPUu579RwMneEuGdWZvK7d8ok",
+                TableName = "endpoint_telemetry"
+            };
+            
+            TelemetryAgent agent = new TelemetryAgent(config, 300);
             
             Application.Run(new TelemetryTrayApplication(agent));
         }
+    }
+
+    public class SupabaseConfig
+    {
+        public string ProjectUrl { get; set; }
+        public string ApiKey { get; set; }
+        public string TableName { get; set; }
     }
 
     public class TelemetryTrayApplication : ApplicationContext
@@ -56,6 +72,7 @@ namespace TelemetryAgent
             trayIcon.ContextMenuStrip.Items.Add("Stop Monitoring", null, StopMonitoring);
             trayIcon.ContextMenuStrip.Items.Add("Send Now", null, SendNow);
             trayIcon.ContextMenuStrip.Items.Add("Settings", null, ShowSettings);
+            trayIcon.ContextMenuStrip.Items.Add("View Logs", null, ViewLogs);
             trayIcon.ContextMenuStrip.Items.Add("-"); // Separator
             trayIcon.ContextMenuStrip.Items.Add("Exit", null, Exit);
 
@@ -88,12 +105,12 @@ namespace TelemetryAgent
             try
             {
                 var telemetry = agent.CollectTelemetry();
-                bool success = await agent.SendTelemetryAsync(telemetry);
+                bool success = await agent.SendTelemetryToSupabaseAsync(telemetry);
                 
                 if (success)
-                    trayIcon.ShowBalloonTip(3000, "Telemetry Agent", "Data sent successfully", ToolTipIcon.Info);
+                    trayIcon.ShowBalloonTip(3000, "Telemetry Agent", "Data sent successfully to Supabase", ToolTipIcon.Info);
                 else
-                    trayIcon.ShowBalloonTip(3000, "Telemetry Agent", "Failed to send data", ToolTipIcon.Error);
+                    trayIcon.ShowBalloonTip(3000, "Telemetry Agent", "Failed to send data to Supabase", ToolTipIcon.Error);
             }
             catch (Exception ex)
             {
@@ -108,6 +125,18 @@ namespace TelemetryAgent
             MessageBox.Show("Settings dialog not implemented yet.", "Settings", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
+        private void ViewLogs(object sender, EventArgs e)
+        {
+            try
+            {
+                Process.Start(Logger.LogPath);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Could not open log file: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
         private void Exit(object sender, EventArgs e)
         {
             // Clean up before exiting
@@ -120,18 +149,24 @@ namespace TelemetryAgent
 
     public class TelemetryAgent
     {
-        private readonly string serverUrl;
+        private readonly SupabaseConfig supabaseConfig;
         private readonly int interval;
         private Task monitoringTask;
         private HttpClient httpClient;
 
         public bool IsRunning => monitoringTask != null && !monitoringTask.IsCompleted;
 
-        public TelemetryAgent(string serverUrl, int intervalSeconds)
+        public TelemetryAgent(SupabaseConfig config, int intervalSeconds)
         {
-            this.serverUrl = serverUrl;
+            this.supabaseConfig = config;
             this.interval = intervalSeconds;
+            
             this.httpClient = new HttpClient();
+            this.httpClient.BaseAddress = new Uri(config.ProjectUrl);
+            this.httpClient.DefaultRequestHeaders.Accept.Clear();
+            this.httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            this.httpClient.DefaultRequestHeaders.Add("apikey", config.ApiKey);
+            this.httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {config.ApiKey}");
         }
 
         public void Start(CancellationToken cancellationToken)
@@ -146,12 +181,12 @@ namespace TelemetryAgent
                     try
                     {
                         var telemetry = CollectTelemetry();
-                        await SendTelemetryAsync(telemetry);
-                        Logger.LogInfo("Telemetry data sent successfully");
+                        await SendTelemetryToSupabaseAsync(telemetry);
+                        Logger.LogInfo("Telemetry data sent successfully to Supabase");
                     }
                     catch (Exception ex)
                     {
-                        Logger.LogError($"Error in telemetry collection: {ex.Message}");
+                        Logger.LogError($"Error in telemetry collection or sending: {ex.Message}");
                     }
 
                     await Task.Delay(TimeSpan.FromSeconds(interval), cancellationToken);
@@ -166,7 +201,7 @@ namespace TelemetryAgent
 
         public TelemetryData CollectTelemetry()
         {
-            return new TelemetryData
+            var telemetryData = new TelemetryData
             {
                 DeviceInfo = CollectDeviceInfo(),
                 NetworkInfo = CollectNetworkInfo(),
@@ -174,24 +209,47 @@ namespace TelemetryAgent
                 SecurityInfo = CollectSecurityInfo(),
                 EventLogs = CollectEventLogs()
             };
+
+            Logger.LogInfo("Telemetry data collected successfully");
+            return telemetryData;
         }
 
-        public async Task<bool> SendTelemetryAsync(TelemetryData telemetry)
+        public async Task<bool> SendTelemetryToSupabaseAsync(TelemetryData telemetry)
         {
             try
             {
-                string json = JsonSerializer.Serialize(telemetry, new JsonSerializerOptions
+                var telemetryRecord = new SupabaseTelemetryRecord
                 {
-                    WriteIndented = true
+                    CollectionTime = DateTime.Now,
+                    DeviceId = Environment.MachineName,
+                    TelemetryData = telemetry
+                };
+
+                string json = JsonSerializer.Serialize(telemetryRecord, new JsonSerializerOptions
+                {
+                    WriteIndented = false,
+                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase
                 });
 
+                string endpoint = $"/rest/v1/{supabaseConfig.TableName}";
                 var content = new StringContent(json, Encoding.UTF8, "application/json");
-                var response = await httpClient.PostAsync(serverUrl, content);
+                
+                httpClient.DefaultRequestHeaders.Remove("Prefer");
+                httpClient.DefaultRequestHeaders.Add("Prefer", "return=minimal");
+
+                var response = await httpClient.PostAsync(endpoint, content);
+                
+                if (!response.IsSuccessStatusCode)
+                {
+                    string errorResponse = await response.Content.ReadAsStringAsync();
+                    Logger.LogError($"Supabase error: {response.StatusCode}, {errorResponse}");
+                }
 
                 return response.IsSuccessStatusCode;
             }
-            catch
+            catch (Exception ex)
             {
+                Logger.LogError($"Exception sending to Supabase: {ex.Message}");
                 return false;
             }
         }
@@ -379,44 +437,63 @@ namespace TelemetryAgent
                     }
                 }
 
-                // Check Windows Firewall status
-                using (var searcher = new ManagementObjectSearcher(@"SELECT * FROM FirewallProduct"))
+                // Check Firewall status
+                try
                 {
-                    foreach (var firewall in searcher.Get())
+                    using (var firewall = new ManagementObjectSearcher(@"root\SecurityCenter2", "SELECT * FROM FirewallProduct"))
                     {
-                        securityInfo.Firewall = new FirewallStatus
+                        foreach (var fw in firewall.Get())
                         {
-                            Name = firewall["displayName"].ToString(),
-                            Enabled = Convert.ToBoolean(firewall["enabled"])
-                        };
-                        break;
+                            securityInfo.Firewall = new FirewallStatus
+                            {
+                                Name = fw["displayName"].ToString(),
+                                Enabled = (Convert.ToInt32(fw["productState"]) & 0x1000) != 0
+                            };
+                            break;
+                        }
                     }
                 }
-
-                // Check antivirus status
-                using (var searcher = new ManagementObjectSearcher(@"SELECT * FROM AntiVirusProduct"))
+                catch
                 {
-                    foreach (var antivirus in searcher.Get())
+                    // Fall back to Windows Firewall if SecurityCenter2 query fails
+                    securityInfo.Firewall = new FirewallStatus
                     {
-                        securityInfo.Antivirus = new AntivirusStatus
-                        {
-                            Name = antivirus["displayName"].ToString(),
-                            Enabled = Convert.ToBoolean(antivirus["productState"])
-                        };
-                        break;
-                    }
-                }
-
-                // Check Windows Update status
-                using (var updateSession = new UpdateSession())
-                {
-                    var updateSearcher = updateSession.CreateUpdateSearcher();
-                    var pendingCount = updateSearcher.GetTotalHistoryCount();
-                    securityInfo.WindowsUpdateStatus = new WindowsUpdateStatus
-                    {
-                        PendingUpdates = pendingCount
+                        Name = "Windows Firewall",
+                        Enabled = IsWindowsFirewallEnabled()
                     };
                 }
+
+                // Check Antivirus status
+                try
+                {
+                    using (var antivirus = new ManagementObjectSearcher(@"root\SecurityCenter2", "SELECT * FROM AntiVirusProduct"))
+                    {
+                        foreach (var av in antivirus.Get())
+                        {
+                            securityInfo.Antivirus = new AntivirusStatus
+                            {
+                                Name = av["displayName"].ToString(),
+                                Enabled = (Convert.ToInt32(av["productState"]) & 0x1000) != 0
+                            };
+                            break;
+                        }
+                    }
+                }
+                catch
+                {
+                    // Cannot determine AV status
+                    securityInfo.Antivirus = new AntivirusStatus
+                    {
+                        Name = "Unknown",
+                        Enabled = false
+                    };
+                }
+
+                // Windows Update status simplified
+                securityInfo.WindowsUpdateStatus = new WindowsUpdateStatus
+                {
+                    PendingUpdates = 0 // Simplified, would require COM interop in a real implementation
+                };
             }
             catch (Exception ex)
             {
@@ -424,6 +501,27 @@ namespace TelemetryAgent
             }
 
             return securityInfo;
+        }
+
+        private bool IsWindowsFirewallEnabled()
+        {
+            try
+            {
+                using (var key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\StandardProfile"))
+                {
+                    if (key != null)
+                    {
+                        object value = key.GetValue("EnableFirewall");
+                        if (value != null)
+                        {
+                            return Convert.ToBoolean(value);
+                        }
+                    }
+                }
+            }
+            catch { }
+            
+            return false;
         }
 
         private List<EventLogEntry> CollectEventLogs()
@@ -436,29 +534,36 @@ namespace TelemetryAgent
 
                 foreach (string logName in logNames)
                 {
-                    using (var eventLog = new EventLog(logName))
+                    try
                     {
-                        // Get the most recent 50 entries
-                        var entries = eventLog.Entries.Cast<System.Diagnostics.EventLogEntry>()
-                            .OrderByDescending(e => e.TimeGenerated)
-                            .Take(50);
-
-                        foreach (var entry in entries)
+                        using (var eventLog = new EventLog(logName))
                         {
-                            // Only include warnings and errors
-                            if (entry.EntryType == EventLogEntryType.Error || entry.EntryType == EventLogEntryType.Warning)
+                            // Get the most recent 20 entries
+                            var entries = eventLog.Entries.Cast<System.Diagnostics.EventLogEntry>()
+                                .OrderByDescending(e => e.TimeGenerated)
+                                .Take(20);
+
+                            foreach (var entry in entries)
                             {
-                                eventLogs.Add(new EventLogEntry
+                                // Only include warnings and errors
+                                if (entry.EntryType == EventLogEntryType.Error || entry.EntryType == EventLogEntryType.Warning)
                                 {
-                                    LogName = logName,
-                                    EntryType = entry.EntryType.ToString(),
-                                    Source = entry.Source,
-                                    EventID = entry.EventID,
-                                    Message = entry.Message,
-                                    TimeGenerated = entry.TimeGenerated
-                                });
+                                    eventLogs.Add(new EventLogEntry
+                                    {
+                                        LogName = logName,
+                                        EntryType = entry.EntryType.ToString(),
+                                        Source = entry.Source,
+                                        EventID = entry.EventID,
+                                        Message = entry.Message,
+                                        TimeGenerated = entry.TimeGenerated
+                                    });
+                                }
                             }
                         }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogError($"Error accessing {logName} log: {ex.Message}");
                     }
                 }
             }
@@ -471,10 +576,17 @@ namespace TelemetryAgent
         }
     }
 
+    // Supabase specific record structure
+    public class SupabaseTelemetryRecord
+    {
+        public DateTime CollectionTime { get; set; }
+        public string DeviceId { get; set; }
+        public TelemetryData TelemetryData { get; set; }
+    }
+
     // Data models for telemetry
     public class TelemetryData
     {
-        public DateTime CollectionTime { get; set; } = DateTime.Now;
         public DeviceInfo DeviceInfo { get; set; }
         public NetworkInfo NetworkInfo { get; set; }
         public SoftwareInfo SoftwareInfo { get; set; }
@@ -578,29 +690,10 @@ namespace TelemetryAgent
         public DateTime TimeGenerated { get; set; }
     }
 
-    // Helper class for Windows Update checking
-    public class UpdateSession
-    {
-        public UpdateSearcher CreateUpdateSearcher()
-        {
-            return new UpdateSearcher();
-        }
-    }
-
-    public class UpdateSearcher
-    {
-        public int GetTotalHistoryCount()
-        {
-            // This is a simplified implementation
-            // In a real application, you would use COM interop with the Windows Update API
-            return 0;
-        }
-    }
-
     // Simple logger
     public static class Logger
     {
-        private static readonly string LogPath = Path.Combine(
+        public static readonly string LogPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "TelemetryAgent",
             "logs.txt");
